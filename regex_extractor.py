@@ -2,8 +2,9 @@ from burp import IBurpExtender
 from burp import ITab
 from burp import IContextMenuFactory
 from burp import IBurpExtenderCallbacks
-from javax.swing import JTextArea, JScrollPane, JMenuItem, JPanel, JLabel, JTextField, JSplitPane, SwingConstants, JTabbedPane, SwingUtilities, JComboBox
-from javax.swing.event import DocumentListener
+from javax.swing import JTextArea, JScrollPane, JMenuItem, JPanel, JLabel, JTextField, JSplitPane, SwingConstants, JTabbedPane, SwingUtilities, JComboBox, JButton
+from javax.swing.event import DocumentListener, CaretListener
+from javax.swing.text import DefaultHighlighter
 from java.awt import BorderLayout, Dimension, Font, FlowLayout
 from java.util import ArrayList
 from java.lang import String
@@ -69,12 +70,37 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
 
     def _init_ui(self):
-        # Left side: Response Data
+        # Left side: Response Data (with Search)
+        self._left_panel = JPanel(BorderLayout())
+        
+        # Search Panel
+        # Search Panel
+        search_panel = JPanel(BorderLayout())
+        search_label = JLabel("Search: ")
+        self._search_field = JTextField()
+        self._search_field.getDocument().addDocumentListener(RegexListener(self._update_search_highlights))
+        
+        # Search Navigation Buttons
+        btn_panel = JPanel(FlowLayout(FlowLayout.RIGHT))
+        self._btn_prev = JButton("<", actionPerformed=self._search_prev)
+        self._btn_next = JButton(">", actionPerformed=self._search_next)
+        btn_panel.add(self._btn_prev)
+        btn_panel.add(self._btn_next)
+
+        search_panel.add(search_label, BorderLayout.WEST)
+        search_panel.add(self._search_field, BorderLayout.CENTER)
+        search_panel.add(btn_panel, BorderLayout.EAST)
+
         self._response_area = JTextArea()
         self._response_area.setFont(Font("Monospaced", Font.PLAIN, 12))
         self._response_area.setLineWrap(True)
+        self._response_area.addCaretListener(self._on_response_selection)
+
         self._response_scroll = JScrollPane(self._response_area)
         self._response_scroll.setPreferredSize(Dimension(500, 400))
+        
+        self._left_panel.add(search_panel, BorderLayout.NORTH)
+        self._left_panel.add(self._response_scroll, BorderLayout.CENTER)
         
         # Right side: Regex Input and Matches
         self._regex_panel = JPanel(BorderLayout())
@@ -116,7 +142,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         self._regex_panel.add(self._matches_scroll, BorderLayout.CENTER)
 
         # Split Pane
-        self._split_pane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, self._response_scroll, self._regex_panel)
+        self._split_pane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, self._left_panel, self._regex_panel)
         self._split_pane.setResizeWeight(0.5)
 
     def _on_preset_change(self, event):
@@ -148,26 +174,43 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         message_info = selected_messages[0]
         
         # Prefer response, fallback to request
-        data = None
-        response_bytes = message_info.getResponse()
+        data_bytes = message_info.getResponse()
+        is_response = True
+        if not data_bytes:
+            data_bytes = message_info.getRequest()
+            is_response = False
         
-        if response_bytes:
-            try:
-                # Force UTF-8 decoding for proper Chinese character display
-                data = String(response_bytes, "UTF-8")
-            except Exception:
-                data = self._helpers.bytesToString(response_bytes)
+        if not data_bytes:
+            return
+
+        # Analyze to split headers and body
+        if is_response:
+            analyzed = self._helpers.analyzeResponse(data_bytes)
         else:
-            request_bytes = message_info.getRequest()
-            if request_bytes:
-                try:
-                    data = String(request_bytes, "UTF-8")
-                except Exception:
-                    data = self._helpers.bytesToString(request_bytes)
+            analyzed = self._helpers.analyzeRequest(data_bytes)
         
-        if data:
-            self._response_area.setText(data)
-            self._update_matches(None)
+        offset = analyzed.getBodyOffset()
+        
+        # Extract Headers
+        header_bytes = data_bytes[:offset]
+        header_str = self._helpers.bytesToString(header_bytes)
+        
+        # Extract Body
+        body_bytes = data_bytes[offset:]
+        try:
+            # Force UTF-8 decoding for proper Chinese character display
+            body_str = String(body_bytes, "UTF-8")
+        except Exception:
+            body_str = self._helpers.bytesToString(body_bytes)
+        
+        # Format Body (JS/JSON)
+        formatted_body = self._try_format_data(unicode(body_str), message_info)
+        
+        # Combine Header and Formatted Body
+        full_text = header_str + formatted_body
+        self._response_area.setText(full_text)
+        
+        self._update_matches(None)
         
         # Highlight the tab
         SwingUtilities.invokeLater(self._switch_to_me)
@@ -211,6 +254,156 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                 self._matches_area.setText("No matches found.")
         except Exception as e:
             self._matches_area.setText("Regex Error: " + str(e))
+
+    def _on_response_selection(self, event):
+        selected_text = self._response_area.getSelectedText()
+        if selected_text:
+            # Escape regex special characters so the selection matches literally
+            escaped_text = re.escape(selected_text)
+            
+            current_pattern = self._regex_field.getText()
+            if escaped_text != current_pattern:
+                 self._regex_field.setText(escaped_text)
+
+    def _update_search_highlights(self, event):
+        term = self._search_field.getText()
+        highlighter = self._response_area.getHighlighter()
+        highlighter.removeAllHighlights()
+        
+        self._search_matches = []
+        self._current_match_index = -1
+        
+        if not term or len(term) == 0:
+            return
+            
+        content = self._response_area.getText()
+        if not content:
+            return
+            
+        try:
+            index = 0
+            while True:
+                index = content.find(term, index)
+                if index == -1:
+                    break
+                
+                self._search_matches.append(index)
+                try:
+                    highlighter.addHighlight(index, index + len(term), DefaultHighlighter.DefaultPainter)
+                except:
+                    pass
+                index += len(term)
+            
+            # Auto-scroll to first match
+            if self._search_matches:
+                self._current_match_index = 0
+                self._scroll_to_match(0)
+                
+        except:
+             pass
+
+    def _search_next(self, event):
+        if not hasattr(self, '_search_matches') or not self._search_matches:
+            return
+        self._current_match_index = (self._current_match_index + 1) % len(self._search_matches)
+        self._scroll_to_match(self._current_match_index)
+
+    def _search_prev(self, event):
+        if not hasattr(self, '_search_matches') or not self._search_matches:
+            return
+        self._current_match_index = (self._current_match_index - 1 + len(self._search_matches)) % len(self._search_matches)
+        self._scroll_to_match(self._current_match_index)
+
+    def _scroll_to_match(self, idx):
+        if idx < 0 or idx >= len(self._search_matches):
+            return
+        
+        pos = self._search_matches[idx]
+        term_len = len(self._search_field.getText())
+        
+        # Select the match to highlight it and ensure it's visible
+        self._response_area.setCaretPosition(pos)
+        self._response_area.select(pos, pos + term_len)
+        self._response_area.grabFocus()
+        self._search_field.grabFocus() # Return focus to search field so user can keep typing
+
+    def _try_format_data(self, data, message_info):
+        # 1. Determine Type
+        response = message_info.getResponse()
+        is_json = False
+        is_script = False
+        
+        if response:
+            analyzed = self._helpers.analyzeResponse(response)
+            mime = analyzed.getInferredMimeType()
+            
+            if mime == "JSON":
+                is_json = True
+            elif mime == "script":
+                is_script = True
+            
+            # Additional check: Look at Content-Type header explicitly
+            # because "inferred" might be generic
+            if not is_json and not is_script:
+                for h in analyzed.getHeaders():
+                    h_lower = h.lower()
+                    if "content-type:" in h_lower:
+                        if "json" in h_lower:
+                            is_json = True
+                        if "javascript" in h_lower or "ecmascript" in h_lower:
+                            is_script = True
+                        break
+        
+        # 2. Format
+        if is_json:
+            try:
+                parsed = json.loads(data)
+                return json.dumps(parsed, indent=4)
+            except:
+                pass
+        
+        if is_script:
+             # Force beautify even if heuristic fails
+            return self._simple_js_beautify(data)
+        
+        # 3. Heuristic fallback (if no headers matched)
+        stripped = data.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                parsed = json.loads(data)
+                return json.dumps(parsed, indent=4)
+            except:
+                pass
+                
+        return data
+
+    def _simple_js_beautify(self, text):
+        # Improved Indentation-based Beautifier
+        res = []
+        indent_level = 0
+        indent_str = "    "
+        i = 0
+        length = len(text)
+        
+        while i < length:
+            char = text[i]
+            if char == '{':
+                res.append("{\n")
+                indent_level += 1
+                res.append(indent_str * indent_level)
+            elif char == '}':
+                res.append("\n")
+                indent_level = max(0, indent_level - 1)
+                res.append(indent_str * indent_level)
+                res.append("}")
+            elif char == ';':
+                res.append(";\n")
+                res.append(indent_str * indent_level)
+            else:
+                res.append(char)
+            i += 1
+            
+        return "".join(res)
 
 class RegexListener(DocumentListener):
     def __init__(self, callback):
