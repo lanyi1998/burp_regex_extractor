@@ -119,6 +119,10 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         
         # Preset Quick Select
         preset_panel = JPanel(FlowLayout(FlowLayout.RIGHT))
+
+        self._btn_dedup = JButton("Deduplicate", actionPerformed=self._deduplicate_matches)
+        preset_panel.add(self._btn_dedup)
+        
         preset_label = JLabel("Quick Select: ")
         
         preset_keys = sorted(self.presets.keys())
@@ -144,6 +148,22 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         # Split Pane
         self._split_pane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, self._left_panel, self._regex_panel)
         self._split_pane.setResizeWeight(0.5)
+
+    def _deduplicate_matches(self, event):
+        content = self._matches_area.getText()
+        if not content or content == "No matches found." or content.startswith("Regex Error:"):
+            return
+            
+        lines = content.split('\n')
+        seen = set()
+        deduped = []
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                deduped.append(line)
+        
+        self._matches_area.setText('\n'.join(deduped))
+        self._matches_area.setCaretPosition(0)
 
     def _on_preset_change(self, event):
         selected = self._preset_combo.getSelectedItem()
